@@ -30,6 +30,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 )
 
 type BuilderEngineType int
@@ -115,16 +116,17 @@ type builderEngineBase struct {
 	noUpload     bool
 	dumpManifest bool
 	referrer     bool
+	retryCount   int
 }
 
 func (e *builderEngineBase) isGzipLayer(ctx context.Context, idx int) (bool, error) {
 	rc, err := e.fetcher.Fetch(ctx, e.manifest.Layers[idx])
 	if err != nil {
-		return false, fmt.Errorf("isGzipLayer: failed to open layer %d: %w", idx, err)
+		return false, errors.Wrapf(err, "isGzipLayer: failed to open layer %d", idx)
 	}
 	drc, err := compression.DecompressStream(rc)
 	if err != nil {
-		return false, fmt.Errorf("isGzipLayer: failed to open decompress stream for layer %d: %w", idx, err)
+		return false, errors.Wrapf(err, "isGzipLayer: failed to open decompress stream for layer %d", idx)
 	}
 	compress := drc.GetCompression()
 	switch compress {
@@ -170,6 +172,7 @@ func (e *builderEngineBase) mediaTypeImageLayer() string {
 }
 
 func (e *builderEngineBase) uploadManifestAndConfig(ctx context.Context) (specs.Descriptor, error) {
+	shouldUploadBlob := !e.noUpload
 	cbuf, err := json.Marshal(e.config)
 	if err != nil {
 		return specs.Descriptor{}, err
@@ -179,9 +182,9 @@ func (e *builderEngineBase) uploadManifestAndConfig(ctx context.Context) (specs.
 		Digest:    digest.FromBytes(cbuf),
 		Size:      (int64)(len(cbuf)),
 	}
-	if !e.noUpload {
-		if err = uploadBytes(ctx, e.pusher, e.manifest.Config, cbuf); err != nil {
-			return specs.Descriptor{}, fmt.Errorf("failed to upload config: %w", err)
+	if shouldUploadBlob {
+		if err = uploadBytesWithRetry(ctx, e.pusher, e.manifest.Config, cbuf, e.retryCount); err != nil {
+			return specs.Descriptor{}, errors.Wrapf(err, "failed to upload config")
 		}
 		log.G(ctx).Infof("config uploaded")
 	}
@@ -203,9 +206,9 @@ func (e *builderEngineBase) uploadManifestAndConfig(ctx context.Context) (specs.
 		Digest:    digest.FromBytes(cbuf),
 		Size:      (int64)(len(cbuf)),
 	}
-	if !e.noUpload {
-		if err = uploadBytes(ctx, e.pusher, manifestDesc, cbuf); err != nil {
-			return specs.Descriptor{}, fmt.Errorf("failed to upload manifest: %w", err)
+	if shouldUploadBlob {
+		if err = uploadBytesWithRetry(ctx, e.pusher, manifestDesc, cbuf, e.retryCount); err != nil {
+			return specs.Descriptor{}, errors.Wrapf(err, "failed to upload manifest")
 		}
 		e.outputDesc = manifestDesc
 		log.G(ctx).Infof("manifest uploaded, %s", manifestDesc.Digest)
@@ -223,19 +226,19 @@ func (e *builderEngineBase) uploadManifestAndConfig(ctx context.Context) (specs.
 func getBuilderEngineBase(ctx context.Context, resolver remotes.Resolver, ref, targetRef string) (*builderEngineBase, error) {
 	_, desc, err := resolver.Resolve(ctx, ref)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve reference %q: %w", ref, err)
+		return nil, errors.Wrapf(err, "failed to resolve reference %q", ref)
 	}
 	fetcher, err := resolver.Fetcher(ctx, ref)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get fetcher for %q: %w", ref, err)
+		return nil, errors.Wrapf(err, "failed to get fetcher for %q", ref)
 	}
 	pusher, err := resolver.Pusher(ctx, targetRef)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get pusher for %q: %w", targetRef, err)
+		return nil, errors.Wrapf(err, "failed to get pusher for %q", targetRef)
 	}
 	manifest, config, err := fetchManifestAndConfig(ctx, fetcher, desc)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch manifest and config: %w", err)
+		return nil, errors.Wrap(err, "failed to fetch manifest and config")
 	}
 	return &builderEngineBase{
 		resolver:  resolver,
