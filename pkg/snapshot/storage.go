@@ -257,7 +257,7 @@ func (o *snapshotter) attachAndMountBlockDevice(ctx context.Context, snID string
 	if err := lookup(o.overlaybdMountpoint(snID)); err == nil {
 		return nil
 	} else {
-		log.G(ctx).Infof(err.Error())
+		log.G(ctx).Infof("%s", err.Error())
 	}
 
 	targetPath := o.overlaybdTargetPath(snID)
