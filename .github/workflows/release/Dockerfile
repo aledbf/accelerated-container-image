@@ -18,8 +18,11 @@ FROM --platform=${BUILDPLATFORM} ${GO_IMAGE} AS builder
 WORKDIR /src/github.com/containerd/accelerated-container-image
 COPY . .
 ENV DEBIAN_FRONTEND=noninteractive
+ARG COSIGN_VERSION=v3.0.2
 RUN apt update && \
     apt install -y curl && \
+    curl -sfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64 && \
+    chmod +x /usr/local/bin/cosign && \
     curl -sfL https://goreleaser.com/static/run | VERSION=v2.12.5 bash -s -- --version && \
     curl -sfL https://goreleaser.com/static/run | VERSION=v2.12.5 bash -s -- install nfpm && \
     go mod tidy
