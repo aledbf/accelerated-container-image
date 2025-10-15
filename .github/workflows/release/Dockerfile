@@ -37,7 +37,8 @@ ENV RELEASE=${RELEASE_NUM}
 ENV COMMIT_ID="${RELEASE_VERSION}_${RELEASE_NUM}"
 RUN make && \
     nfpm pkg --packager deb --target /tmp/ && \
-    nfpm pkg --packager rpm --target /tmp/
+    nfpm pkg --packager rpm --target /tmp/ && \
+    cp -r bin/* /tmp/
 
 FROM scratch AS release
 COPY --from=builder /tmp/* /
