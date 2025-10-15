@@ -60,7 +60,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: releases
-        path: releases/*/overlaybd-snapshotter*
+        path: releases/**/*.deb
 
   dev-release:
     name: Development Release
@@ -81,7 +81,7 @@ jobs:
           prerelease: true
           title: "Development Build"
           files: |
-            releases/*/overlaybd-snapshotter*
+            releases/**/*.deb
 
   release:
     name: Tagged Release
@@ -99,8 +99,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            releases/linux_amd64/*
-            releases/linux_arm64/*
+          files: releases/**/*.deb
           fail_on_unmatched_files: true
           generate_release_notes: true
+          make_latest: true
