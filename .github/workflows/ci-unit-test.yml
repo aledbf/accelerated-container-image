@@ -10,7 +10,7 @@ on:
 jobs:
   unit-test:
     name: Unit Test
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -22,7 +22,7 @@ jobs:
       - name: install Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22.0'
+          go-version: '1.25.3'
 
       - name: set env
         shell: bash
