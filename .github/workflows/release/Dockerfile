@@ -19,12 +19,12 @@ WORKDIR /src/github.com/containerd/accelerated-container-image
 COPY . .
 ENV DEBIAN_FRONTEND=noninteractive
 ARG COSIGN_VERSION=v3.0.2
+ARG NFPM_VERSION=v2.42.0
 RUN apt update && \
     apt install -y curl && \
     curl -sfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64 && \
     chmod +x /usr/local/bin/cosign && \
-    curl -sfL https://goreleaser.com/static/run | VERSION=v2.12.5 bash -s -- --version && \
-    curl -sfL https://goreleaser.com/static/run | VERSION=v2.12.5 bash -s -- install nfpm && \
+    go install github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION} && \
     go mod tidy
 
 ARG TARGETOS TARGETARCH
