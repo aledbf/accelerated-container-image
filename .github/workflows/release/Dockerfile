@@ -18,9 +18,10 @@ FROM --platform=${BUILDPLATFORM} ${GO_IMAGE} AS builder
 WORKDIR /src/github.com/containerd/accelerated-container-image
 COPY . .
 ENV DEBIAN_FRONTEND=noninteractive
-RUN echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | tee /etc/apt/sources.list.d/goreleaser.list &&  \
-    apt update && \
-    apt install -y nfpm && \
+RUN apt update && \
+    apt install -y curl && \
+    curl -sfL https://goreleaser.com/static/run | VERSION=v2.12.5 bash -s -- --version && \
+    curl -sfL https://goreleaser.com/static/run | VERSION=v2.12.5 bash -s -- install nfpm && \
     go mod tidy
 
 ARG TARGETOS TARGETARCH
