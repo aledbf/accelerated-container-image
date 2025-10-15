@@ -22,15 +22,20 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
+	"net"
 	"os"
 	"path"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/continuity"
 	"github.com/containerd/errdefs"
@@ -38,10 +43,92 @@ import (
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
 	t "github.com/containerd/accelerated-container-image/pkg/types"
 )
+
+// isRetryableError checks if the error is retryable (429 or 5xx errors)
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Registry may return multiple errors in one response (docker.Errors)
+	var regErrs docker.Errors
+	if errors.As(err, &regErrs) {
+		for _, e := range regErrs {
+			switch v := e.(type) {
+			case docker.ErrorCode:
+				if v == docker.ErrorCodeTooManyRequests || v == docker.ErrorCodeUnavailable || v == docker.ErrorCodeUnknown {
+					return true
+				}
+			case docker.Error:
+				if v.Code == docker.ErrorCodeTooManyRequests || v.Code == docker.ErrorCodeUnavailable || v.Code == docker.ErrorCodeUnknown {
+					return true
+				}
+			}
+		}
+	}
+
+	// Unexpected HTTP status codes (e.g., 429 or 5xx)
+	var us remoteerrors.ErrUnexpectedStatus
+	if errors.As(err, &us) {
+		if us.StatusCode == 429 || (us.StatusCode >= 500 && us.StatusCode <= 599) {
+			return true
+		}
+	}
+
+	// Network timeouts
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+
+	return false
+}
+
+// retryWithBackoff executes a function with exponential backoff on retryable errors
+func retryWithBackoff(ctx context.Context, maxRetries int, operation func() error) error {
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		lastErr = operation()
+
+		if lastErr == nil {
+			return nil
+		}
+
+		if !isRetryableError(lastErr) {
+			return lastErr
+		}
+
+		if attempt == maxRetries {
+			logrus.Warnf("max retries (%d) reached for retryable error: %v", maxRetries, lastErr)
+			return lastErr
+		}
+
+		// Exponential backoff with random jitter: base delay of 1s, max 30s
+		baseDelay := time.Duration(math.Min(float64(time.Second)*math.Pow(2, float64(attempt)), float64(30*time.Second)))
+		// Add random jitter: ±25% of the base delay
+		jitter := time.Duration(float64(baseDelay) * (rand.Float64() - 0.5) * 0.5)
+		backoffDelay := baseDelay + jitter
+		// Ensure minimum delay of 500ms
+		if backoffDelay < 500*time.Millisecond {
+			backoffDelay = 500 * time.Millisecond
+		}
+		logrus.Infof("received retryable error, retrying in %v (attempt %d/%d): %v", backoffDelay, attempt+1, maxRetries, lastErr)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoffDelay):
+			continue
+		}
+	}
+
+	return lastErr
+}
 
 func fetch(ctx context.Context, fetcher remotes.Fetcher, desc specs.Descriptor, target any) error {
 	rc, err := fetcher.Fetch(ctx, desc)
@@ -64,7 +151,7 @@ func fetch(ctx context.Context, fetcher remotes.Fetcher, desc specs.Descriptor, 
 
 func fetchManifest(ctx context.Context, fetcher remotes.Fetcher, desc specs.Descriptor) (*specs.Manifest, error) {
 	platformMatcher := platforms.Default()
-	log.G(ctx).Infof("fetching manifest %v with type %v", desc.Digest, desc.MediaType)
+	log.G(ctx).Debugf("fetching manifest %v with type %v", desc.Digest, desc.MediaType)
 	switch desc.MediaType {
 	case images.MediaTypeDockerSchema2Manifest, specs.MediaTypeImageManifest:
 		manifest := specs.Manifest{}
@@ -200,41 +287,57 @@ func getFileDesc(filepath string, decompress bool) (specs.Descriptor, error) {
 }
 
 func uploadBlob(ctx context.Context, pusher remotes.Pusher, path string, desc specs.Descriptor) error {
-	cw, err := pusher.Push(ctx, desc)
-	if err != nil {
-		if errdefs.IsAlreadyExists(err) {
-			logrus.Infof("layer %s exists", desc.Digest.String())
-			return nil
-		}
-		return err
-	}
+	return uploadBlobWithRetry(ctx, pusher, path, desc, 0)
+}
 
-	defer cw.Close()
-	fobd, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer fobd.Close()
-	if err = content.Copy(ctx, cw, fobd, desc.Size, desc.Digest); err != nil {
-		return err
-	}
-	return nil
+func uploadBlobWithRetry(ctx context.Context, pusher remotes.Pusher, path string, desc specs.Descriptor, retryCount int) error {
+	return retryWithBackoff(ctx, retryCount, func() error {
+		cw, err := pusher.Push(ctx, desc)
+		if err != nil {
+			if errdefs.IsAlreadyExists(err) {
+				logrus.Debugf("layer %s exists", desc.Digest.String())
+				return nil
+			}
+			return err
+		}
+
+		defer cw.Close()
+		fobd, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer fobd.Close()
+		if err = content.Copy(ctx, cw, fobd, desc.Size, desc.Digest); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func uploadBytes(ctx context.Context, pusher remotes.Pusher, desc specs.Descriptor, data []byte) error {
-	cw, err := pusher.Push(ctx, desc)
-	if err != nil {
-		if errdefs.IsAlreadyExists(err) {
-			logrus.Infof("content %s exists", desc.Digest.String())
-			return nil
+	return uploadBytesWithRetry(ctx, pusher, desc, data, 0)
+}
+
+func uploadBytesWithRetry(ctx context.Context, pusher remotes.Pusher, desc specs.Descriptor, data []byte, retryCount int) error {
+	return retryWithBackoff(ctx, retryCount, func() error {
+		cw, err := pusher.Push(ctx, desc)
+		if err != nil {
+			if errdefs.IsAlreadyExists(err) {
+				logrus.Infof("content %s exists", desc.Digest.String())
+				return nil
+			}
+			return err
 		}
-		return err
-	}
-	defer cw.Close()
-	return content.Copy(ctx, cw, bytes.NewReader(data), desc.Size, desc.Digest)
+		defer cw.Close()
+		return content.Copy(ctx, cw, bytes.NewReader(data), desc.Size, desc.Digest)
+	})
 }
 
 func tagPreviouslyConvertedManifest(ctx context.Context, pusher remotes.Pusher, fetcher remotes.Fetcher, desc specs.Descriptor) error {
+	return tagPreviouslyConvertedManifestWithRetry(ctx, pusher, fetcher, desc, 0)
+}
+
+func tagPreviouslyConvertedManifestWithRetry(ctx context.Context, pusher remotes.Pusher, fetcher remotes.Fetcher, desc specs.Descriptor, retryCount int) error {
 	manifest := specs.Manifest{}
 	if err := fetch(ctx, fetcher, desc, &manifest); err != nil {
 		return fmt.Errorf("failed to fetch converted manifest: %w", err)
@@ -243,7 +346,7 @@ func tagPreviouslyConvertedManifest(ctx context.Context, pusher remotes.Pusher, 
 	if err != nil {
 		return err
 	}
-	if err := uploadBytes(ctx, pusher, desc, cbuf); err != nil {
+	if err := uploadBytesWithRetry(ctx, pusher, desc, cbuf, retryCount); err != nil {
 		return fmt.Errorf("failed to tag converted manifest: %w", err)
 	}
 	return nil
@@ -252,19 +355,19 @@ func tagPreviouslyConvertedManifest(ctx context.Context, pusher remotes.Pusher, 
 func buildArchiveFromFiles(ctx context.Context, target string, compress compression.Compression, files ...string) error {
 	archive, err := os.Create(target)
 	if err != nil {
-		return fmt.Errorf("failed to create tgz file: %q: %w", target, err)
+		return errors.Wrapf(err, "failed to create tgz file: %q", target)
 	}
 	defer archive.Close()
 	fzip, err := compression.CompressStream(archive, compress)
 	if err != nil {
-		return fmt.Errorf("failed to create compression %v: %w", compress, err)
+		return errors.Wrapf(err, "failed to create compression %v", compress)
 	}
 	defer fzip.Close()
 	ftar := tar.NewWriter(fzip)
 	defer ftar.Close()
 	for _, file := range files {
 		if err := addFileToArchive(ctx, ftar, file); err != nil {
-			return fmt.Errorf("failed to add file %q to archive %q: %w", file, target, err)
+			return errors.Wrapf(err, "failed to add file %q to archive %q", file, target)
 		}
 	}
 	return nil
@@ -276,7 +379,7 @@ func addFileToArchive(ctx context.Context, ftar *tar.Writer, filepath string) er
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		return fmt.Errorf("failed to open file: %q: %w", filepath, err)
+		return errors.Wrapf(err, "failed to open file: %q", filepath)
 	}
 	defer file.Close()
 	info, err := file.Stat()

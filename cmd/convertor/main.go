@@ -52,6 +52,7 @@ var (
 	concurrencyLimit int
 	disableSparse    bool
 	referrer         bool
+	retryCount       int
 
 	// certification
 	certDirs    []string
@@ -71,12 +72,18 @@ Description: overlaybd convertor is a standalone userspace image conversion tool
 
 Version: ` + commitID,
 		Run: func(cmd *cobra.Command, args []string) {
+			// Set default log level to Info, enable Debug with --verbose
+			logrus.SetLevel(logrus.InfoLevel)
 			if verbose {
 				logrus.SetLevel(logrus.DebugLevel)
 			}
 			tb := ""
 			if digestInput == "" && tagInput == "" {
 				logrus.Error("one of input-tag [-i] or input-digest [-g] is required")
+				os.Exit(1)
+			}
+			if repo == "" {
+				logrus.Error("repository is required")
 				os.Exit(1)
 			}
 			if overlaybd == "" && fastoci == "" && turboOCI == "" {
@@ -98,10 +105,13 @@ Version: ` + commitID,
 			}
 
 			ctx := context.Background()
+
+			// Build reference from repo and tag/digest
 			ref := repo + ":" + tagInput
 			if tagInput == "" {
 				ref = repo + "@" + digestInput
 			}
+
 			opt := builder.BuilderOptions{
 				Ref:       ref,
 				Auth:      user,
@@ -123,6 +133,7 @@ Version: ` + commitID,
 				ConcurrencyLimit: concurrencyLimit,
 				DisableSparse:    disableSparse,
 				Referrer:         referrer,
+				RetryCount:       retryCount,
 			}
 			if overlaybd != "" {
 				logrus.Info("building [Overlaybd - Native]  image...")
@@ -132,7 +143,7 @@ Version: ` + commitID,
 				switch dbType {
 				case "mysql":
 					if dbstr == "" {
-						logrus.Warnf("no db-str was provided, falling back to no deduplication")
+						logrus.Debugf("no db-str was provided, falling back to no deduplication")
 					}
 					db, err := sql.Open("mysql", dbstr)
 					if err != nil {
@@ -142,8 +153,8 @@ Version: ` + commitID,
 					opt.DB = database.NewSqlDB(db)
 				case "":
 				default:
-					logrus.Warnf("db-type %s was provided but is not one of known db types. Available: mysql", dbType)
-					logrus.Warnf("falling back to no deduplication")
+					logrus.Debugf("db-type %s was provided but is not one of known db types. Available: mysql", dbType)
+					logrus.Debugf("falling back to no deduplication")
 				}
 
 				if err := builder.Build(ctx, opt); err != nil {
@@ -188,6 +199,7 @@ func init() {
 	rootCmd.Flags().IntVar(&concurrencyLimit, "concurrency-limit", 4, "the number of manifests that can be built at the same time, used for multi-arch images, 0 means no limit")
 	rootCmd.Flags().BoolVar(&disableSparse, "disable-sparse", false, "disable sparse file for overlaybd")
 	rootCmd.Flags().BoolVar(&referrer, "referrer", false, "push converted manifests with subject, note '--oci' will be enabled automatically if '--referrer' is set, cause the referrer must be in OCI format.")
+	rootCmd.Flags().IntVar(&retryCount, "retry-count", 5, "number of retries for registry upload operations when encountering 429 rate limiting or 5xx errors")
 
 	// certification
 	rootCmd.Flags().StringArrayVar(&certDirs, "cert-dir", nil, "In these directories, root CA should be named as *.crt and client cert should be named as *.cert, *.key")
@@ -199,8 +211,6 @@ func init() {
 	rootCmd.Flags().BoolVar(&reserve, "reserve", false, "reserve tmp data")
 	rootCmd.Flags().BoolVar(&noUpload, "no-upload", false, "don't upload layer and manifest")
 	rootCmd.Flags().BoolVar(&dumpManifest, "dump-manifest", false, "dump manifest")
-
-	rootCmd.MarkFlagRequired("repository")
 }
 
 func main() {

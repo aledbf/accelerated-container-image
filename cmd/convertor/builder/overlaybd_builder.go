@@ -21,7 +21,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,12 +34,14 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
 const (
 	overlaybdBaseLayer      = "/opt/overlaybd/baselayers/ext4_64"
 	commitFile              = "overlaybd.commit"
+	layerTarFile            = "layer.tar"
 	labelDistributionSource = "containerd.io/distribution.source"
 )
 
@@ -114,6 +115,18 @@ func (e *overlaybdBuilderEngine) BuildLayer(ctx context.Context, idx int) error 
 		} else {
 			return fmt.Errorf("layer %d is from dedup but commit file is missing", idx)
 		}
+	} else if _, ok := e.manifest.Layers[idx].Annotations[label.OverlayBDBlobDigest]; ok {
+		// this layer is already an overlaybd layer
+		if commitFilePresent {
+			return fmt.Errorf("layer %d was not converted yet a commit file is present", idx)
+		}
+
+		logrus.Debugf("layer %d is already in overlaybd format", idx)
+
+		// Simply rename the layer.tar file to the commit file.
+		if err := os.Rename(path.Join(layerDir, layerTarFile), path.Join(layerDir, commitFile)); err != nil {
+			return errors.Wrapf(err, "failed to prepare overlaybd layer %d for mounting", idx)
+		}
 	} else {
 		// This should not happen, but if it does, we should fail the conversion or
 		// risk corrupting the image.
@@ -162,7 +175,7 @@ func (e *overlaybdBuilderEngine) UploadLayer(ctx context.Context, idx int) error
 	layerDir := e.getLayerDir(idx)
 	desc, err := getFileDesc(path.Join(layerDir, commitFile), false)
 	if err != nil {
-		return fmt.Errorf("failed to get descriptor for layer %d: %w", idx, err)
+		return errors.Wrapf(err, "failed to get descriptor for layer %d", idx)
 	}
 	if e.overlaybdLayers[idx].fromDedup {
 		// validate that the layer digests match if the layer is from dedup
@@ -175,10 +188,12 @@ func (e *overlaybdBuilderEngine) UploadLayer(ctx context.Context, idx int) error
 		label.OverlayBDVersion:    version.OverlayBDVersionNumber,
 		label.OverlayBDBlobDigest: desc.Digest.String(),
 		label.OverlayBDBlobSize:   fmt.Sprintf("%d", desc.Size),
+		label.OverlayBDBlobFsType: e.fstype,
 	}
-	if !e.noUpload {
-		if err := uploadBlob(ctx, e.pusher, path.Join(layerDir, commitFile), desc); err != nil {
-			return fmt.Errorf("failed to upload layer %d: %w", idx, err)
+	shouldUploadBlob := !e.noUpload
+	if shouldUploadBlob {
+		if err := uploadBlobWithRetry(ctx, e.pusher, path.Join(layerDir, commitFile), desc, e.retryCount); err != nil {
+			return errors.Wrapf(err, "failed to upload layer %d", idx)
 		}
 	}
 	e.overlaybdLayers[idx].desc = desc
@@ -339,7 +354,7 @@ func (e *overlaybdBuilderEngine) CheckForConvertedManifest(ctx context.Context) 
 
 // If a converted manifest has been found we still need to tag it to match the expected output tag.
 func (e *overlaybdBuilderEngine) TagPreviouslyConvertedManifest(ctx context.Context, desc specs.Descriptor) error {
-	return tagPreviouslyConvertedManifest(ctx, e.pusher, e.fetcher, desc)
+	return tagPreviouslyConvertedManifestWithRetry(ctx, e.pusher, e.fetcher, desc, e.retryCount)
 }
 
 // mountImage is responsible for mounting a specific manifest from a source repository, this includes
@@ -376,7 +391,7 @@ func (e *overlaybdBuilderEngine) mountImage(ctx context.Context, manifest specs.
 	if err != nil {
 		return err
 	}
-	return uploadBytes(ctx, e.pusher, desc, cbuf)
+	return uploadBytesWithRetry(ctx, e.pusher, desc, cbuf, e.retryCount)
 }
 
 func (e *overlaybdBuilderEngine) StoreConvertedManifestDetails(ctx context.Context) error {
@@ -406,7 +421,7 @@ func (e *overlaybdBuilderEngine) DownloadConvertedLayer(ctx context.Context, idx
 	if err != nil {
 		// We should remove the commit file if the download failed to allow for fallback conversion
 		os.Remove(targetFile) // Remove any file that may have failed to download
-		return fmt.Errorf("failed to download layer %d: %w", idx, err)
+		return errors.Wrapf(err, "failed to download layer %d", idx)
 	}
 	// Mark that this layer is from dedup
 	e.overlaybdLayers[idx].fromDedup = true
@@ -425,7 +440,7 @@ func (e *overlaybdBuilderEngine) uploadBaseLayer(ctx context.Context) (specs.Des
 	tarFile := path.Join(e.workDir, "ext4_64.tar")
 	fdes, err := os.Create(tarFile)
 	if err != nil {
-		return specs.Descriptor{}, fmt.Errorf("failed to create file %s: %w", tarFile, err)
+		return specs.Descriptor{}, errors.Wrapf(err, "failed to create file %s", tarFile)
 	}
 	digester := digest.Canonical.Digester()
 	countWriter := &writeCountWrapper{w: io.MultiWriter(fdes, digester.Hash())}
@@ -433,11 +448,11 @@ func (e *overlaybdBuilderEngine) uploadBaseLayer(ctx context.Context) (specs.Des
 
 	fsrc, err := os.Open(overlaybdBaseLayer)
 	if err != nil {
-		return specs.Descriptor{}, fmt.Errorf("failed to open %s: %w", overlaybdBaseLayer, err)
+		return specs.Descriptor{}, errors.Wrapf(err, "failed to open %s", overlaybdBaseLayer)
 	}
 	fstat, err := os.Stat(overlaybdBaseLayer)
 	if err != nil {
-		return specs.Descriptor{}, fmt.Errorf("failed to get info of %s: %w", overlaybdBaseLayer, err)
+		return specs.Descriptor{}, errors.Wrapf(err, "failed to get info of %s", overlaybdBaseLayer)
 	}
 
 	if err := tarWriter.WriteHeader(&tar.Header{
@@ -446,13 +461,13 @@ func (e *overlaybdBuilderEngine) uploadBaseLayer(ctx context.Context) (specs.Des
 		Size:     fstat.Size(),
 		Typeflag: tar.TypeReg,
 	}); err != nil {
-		return specs.Descriptor{}, fmt.Errorf("failed to write tar header: %w", err)
+		return specs.Descriptor{}, errors.Wrapf(err, "failed to write tar header")
 	}
 	if _, err := io.Copy(tarWriter, bufio.NewReader(fsrc)); err != nil {
-		return specs.Descriptor{}, fmt.Errorf("failed to copy IO: %w", err)
+		return specs.Descriptor{}, errors.Wrapf(err, "failed to copy IO")
 	}
 	if err = tarWriter.Close(); err != nil {
-		return specs.Descriptor{}, fmt.Errorf("failed to close tar file: %w", err)
+		return specs.Descriptor{}, errors.Wrapf(err, "failed to close tar file")
 	}
 
 	baseDesc := specs.Descriptor{
@@ -463,13 +478,15 @@ func (e *overlaybdBuilderEngine) uploadBaseLayer(ctx context.Context) (specs.Des
 			label.OverlayBDVersion:    version.OverlayBDVersionNumber,
 			label.OverlayBDBlobDigest: digester.Digest().String(),
 			label.OverlayBDBlobSize:   fmt.Sprintf("%d", countWriter.c),
+			label.OverlayBDBlobFsType: e.fstype,
 		},
 	}
-	if !e.noUpload {
-		if err = uploadBlob(ctx, e.pusher, tarFile, baseDesc); err != nil {
-			return specs.Descriptor{}, fmt.Errorf("failed to upload baselayer: %w", err)
+	shouldUploadBlob := !e.noUpload
+	if shouldUploadBlob {
+		if err = uploadBlobWithRetry(ctx, e.pusher, tarFile, baseDesc, e.retryCount); err != nil {
+			return specs.Descriptor{}, errors.Wrapf(err, "failed to upload baselayer")
 		}
-		logrus.Infof("baselayer uploaded")
+		logrus.Debugf("baselayer uploaded")
 	}
 	return baseDesc, nil
 }
@@ -509,7 +526,7 @@ func (e *overlaybdBuilderEngine) commit(ctx context.Context, dir string, idx int
 	if err := utils.Commit(ctx, dir, dir, false, opts...); err != nil {
 		return err
 	}
-	logrus.Infof("layer %d committed, uuid: %s, parent uuid: %s", idx, curUUID, parentUUID)
+	logrus.Debugf("layer %d committed, uuid: %s, parent uuid: %s", idx, curUUID, parentUUID)
 	return nil
 }
 
